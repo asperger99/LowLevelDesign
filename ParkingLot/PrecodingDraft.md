@@ -36,9 +36,9 @@ PaymentType      : UPI, CreditCard, DebitCard, Cash
 > No behavioral divergence across Bike/Car/Truck today — only `VehicleType` differs (same reasoning as `ParkingSpot`). Enum is correct, not subclassing → avoids YAGNI violation. Revisit only if a vehicle type needs distinct behavior (e.g. EV charging logic).
 
 **Fields:**
-- `string numberPlate`
+- `string licensePlate`
 - `VehicleType type`
-- `string Color`
+- `string color`
 
 **Methods:** *(none)*
 
@@ -49,16 +49,15 @@ PaymentType      : UPI, CreditCard, DebitCard, Cash
 > Collapsed `SmallSpot/MediumSpot/LargeSpot` into a single class — no behavioral difference between sizes, only a `SpotType` value.
 
 **Fields:**
-- `string Id`
-- `int FloorNumber`
-- `bool isOccupied`
+- `Guid id`
+- `int floorNumber`
+- `bool isOccupied` *(property, not a method)*
 - `string vehicleNumberPlate`
 - `ParkingSpotType spotType`
 
 **Methods:**
 - `bool Park(string vehicleNumberPlate)`
-- `bool Unpark()`
-- `bool IsOccupied()`
+- `bool UnPark()`
 
 ---
 
@@ -74,27 +73,41 @@ PaymentType      : UPI, CreditCard, DebitCard, Cash
 
 ---
 
-### `Gate` (abstract — inherited by `EntryGate`, `ExitGate`)
+### `EntryGate` / `ExitGate` (standalone classes — NOT a shared hierarchy)
 
-**Fields:**
+> Originally planned as `abstract Gate` with subclasses, but dropped: they share only an `id` field and are never used polymorphically (no `List<Gate>`). More importantly, their `Process()` signatures are incompatible — `EntryGate.Process(Vehicle)` vs `ExitGate.Process(string ticketId)` — so forcing a shared base meant both overrides would throw. Standalone classes are the honest shape.
+
+**`EntryGate` fields:**
 - `string id`
+- `IParkingLotService parkingLotService` *(injected)*
 
-**Methods:**
-- `process()` — for `EntryGate`: processes parking + generates ticket by calling `ParkingLotService`. For `ExitGate`: frees up the parking spot, completes payment, updates ticket by calling the responsible services.
+**`EntryGate` methods:**
+- `Ticket Process(Vehicle vehicle)` — calls `ParkingLotService.ParkVehicle`, prints result, returns ticket
+
+**`ExitGate` fields:**
+- `string id`
+- `IParkingLotService parkingLotService` *(injected)*
+
+**`ExitGate` methods:**
+- `bool Process(string ticketId)` — calls `ParkingLotService.UnParkVehicle`, prints result, returns success
 
 ---
 
 ### `Ticket` (class)
 
 **Fields:**
-- `string id`
-- `string parkingSpotId`
+- `Guid id`
+- `Guid parkingSpotId`
+- `int floorNumber`
 - `string vehicleNumberPlate`
 - `VehicleType vehicleType`
 - `DateTime parkedAt`
-- `DateTime unParkedAt`
-- `decimal Amount`
+- `DateTime? unParkedAt` *(nullable — null until vehicle exits)*
+- `decimal amount`
 - `string currency`
+
+**Methods:**
+- `void UnPark(DateTime unParkedAt, decimal amount, string currency)` — sets exit fields
 
 ---
 
@@ -112,9 +125,9 @@ bool UnParkVehicle(string ticketId)
 ### `ITicketService`
 
 ```
-Ticket CreateTicket(string parkingSpotId, string vehicleNumberPlate, VehicleType vehicleType)
+Ticket CreateTicket(Guid parkingSpotId, int floorNumber, string vehicleNumberPlate, VehicleType vehicleType)
 Ticket GetTicket(string ticketId)
-Ticket UpdateTicket(string ticketId, DateTime unParkedAt, decimal amount)
+Ticket UpdateTicket(string ticketId, DateTime unParkedAt, decimal amount, string currency)
 ```
 
 ---
@@ -126,10 +139,12 @@ Ticket UpdateTicket(string ticketId, DateTime unParkedAt, decimal amount)
 ```
 bool AddFloor(int floorNumber)
 bool AddParkingSpot(int floorNumber, ParkingSpot spot)
-bool ParkVehicleAtSpot(int floorNumber, string parkingSpotId, string vehicleNumberPlate)
+bool ParkVehicleAtSpot(int floorNumber, Guid parkingSpotId, string vehicleNumberPlate)
     // lock spotId -> re-check isOccupied -> persist via repository -> unlock
-bool FreeSpot(int floorNumber, string parkingSpotId)
-    // lock spotId -> mark unoccupied via repository -> unlock
+ParkingSpot FreeSpot(int floorNumber, Guid parkingSpotId)
+    // lock spotId -> mark unoccupied via repository -> unlock -> return the freed spot
+    // returns the SAME instance so caller can re-enqueue it into the strategy
+    // (a new ParkingSpot() would get a new Guid not in the repository)
 ```
 
 ---
@@ -151,8 +166,8 @@ bool MakePayment(decimal amount, PaymentType type, string ticketId)
 ```
 ParkingSpot GetParkingSpot(VehicleType vehicleType, string gateId = null)
     // removes/dequeues spot from in-memory DS at selection time
-bool AddSpotBack(int floorNumber, ParkingSpot spot)
-    // re-enqueue on unpark
+bool AddParkingSpot(ParkingSpot parkingSpot)
+    // re-enqueue on unpark; spot already carries floorNumber, no extra param needed
 ```
 
 ---
@@ -172,9 +187,11 @@ decimal CalculatePrice(Ticket ticket)
 ```
 bool AddFloor(int floorNumber)
 bool AddParkingSpot(int floorNumber, ParkingSpot spot)
-ParkingSpot GetSpot(int floorNumber, string spotId)
-bool UpdateSpotStatus(int floorNumber, string spotId, bool isOccupied, string vehicleNumberPlate)
+ParkingSpot GetSpot(int floorNumber, Guid spotId)
+bool UpdateSpotStatus(int floorNumber, Guid spotId, bool isOccupied, string vehicleNumberPlate)
 List<ParkingSpot> GetAllSpots(int floorNumber)
+Floor GetFloor(int floorNumber)
+bool IsFloorFull(int floorNumber)
 ```
 
 ---
@@ -182,8 +199,9 @@ List<ParkingSpot> GetAllSpots(int floorNumber)
 ### `ITicketRepository`
 
 ```
-AddTicket(Ticket ticket)
-UpdateTicket(Ticket ticket)
+Ticket AddTicket(Ticket ticket)
+Ticket UpdateTicket(Ticket ticket)
+Ticket GetTicket(Guid ticketId)
 ```
 
 ---
@@ -193,26 +211,42 @@ UpdateTicket(Ticket ticket)
 **Park:**
 ```
 ParkingLotService.ParkVehicle(vehicle)
-  loop:
-    spot = strategy.GetParkingSpot(vehicleType)   // atomic dequeue
+  loop (up to maxAttempts):
+    spot = strategy.GetParkingSpot(vehicleType)        // atomic dequeue
     if spot == null → fail, no spots available
-    success = floorService.ParkVehicleAtSpot(floor, spot.Id, plate)
-    if success:
-        ticket = ticketService.CreateTicket(spot.Id, plate, vehicleType)
-        return ticket
-    else:
-        continue loop  // defensive fallback, try next spot
+    committed = floorService.ParkVehicleAtSpot(spot.floorNumber, spot.id, plate)
+    if committed:
+        return ticketService.CreateTicket(spot.id, spot.floorNumber, plate, vehicleType)
+    // lost race (rare) — spot is genuinely occupied, do NOT re-enqueue, try next
 ```
 
 **Unpark:**
 ```
-ParkingLotService.UnparkVehicle(ticketId)
+ParkingLotService.UnParkVehicle(ticketId)
   ticket = ticketService.GetTicket(ticketId)
-  floorService.FreeSpot(ticket.floorNumber, ticket.parkingSpotId)
-  strategy.AddSpotBack(ticket.floorNumber, spot)
-  amount = priceStrategy.CalculatePrice(ticket)
-  paymentService.MakePayment(amount, ...)
-  ticketService.UpdateTicket(...)
+  freedSpot = floorService.FreeSpot(ticket.floorNumber, ticket.parkingSpotId)
+  strategy.AddParkingSpot(freedSpot)             // re-enqueue the SAME instance
+  // build a temp ticket copy to calculate price (original ticket not yet updated)
+  amount = priceStrategy.CalculatePrice(tempTicket)
+  paymentService.MakePayment(amount, PaymentType.Upi, ticketId)
+  ticketService.UpdateTicket(ticketId, unParkedAt, amount, "INR")
+```
+
+---
+
+## `ParkingLot` (facade + composition root)
+
+> Wraps all services and gates behind a simple public API. Also owns the console interaction loop — `Program.cs` just builds and calls `Start()`.
+
+**Fields:** `IParkingFloorService`, `IParkingLotService`, `IParkingStrategy`, `List<EntryGate>`, `List<ExitGate>`
+
+**Public API:**
+```
+bool AddFloor(int floorNumber)
+bool AddParkingSpot(int floorNumber, ParkingSpot spot)  // also enqueues spot into strategy
+Ticket ParkVehicle(Vehicle vehicle)
+bool UnParkVehicle(string ticketId)
+void Start()   // console interaction loop
 ```
 
 ---
