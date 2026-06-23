@@ -605,21 +605,26 @@ public class ParkingLotService : IParkingLotService
         if (ticket == null)
             return false;
 
-        var freedSpot = _floorService.FreeSpot(ticket.floorNumber, ticket.parkingSpotId);
-        if (freedSpot == null)
-            return false;
-
-        // Re-enqueue the SAME spot instance returned by FreeSpot - not a newly
-        // constructed one. A new ParkingSpot() would get a new Guid id that doesn't
-        // exist in the repository, creating a phantom entry in the strategy's queue.
-        _parkingStrategy.AddParkingSpot(freedSpot);
-
         var unparkedAt = DateTime.UtcNow;
         var tempTicket = new Ticket(ticket.parkingSpotId, ticket.floorNumber, ticket.vehicleNumberPlate, ticket.vehicleType, ticket.parkedAt);
         tempTicket.UnPark(unparkedAt, 0, "INR");
         var amount = _priceStrategy.CalculatePrice(tempTicket);
 
-        _paymentService.MakePayment(amount, PaymentType.Upi, ticketId);
+        // Payment happens BEFORE the spot is released. If payment fails, the spot
+        // stays occupied (car stays at the barrier) instead of being freed and
+        // potentially re-allocated to another vehicle while this one is still there.
+        var paid = _paymentService.MakePayment(amount, PaymentType.Upi, ticketId);
+        if (!paid)
+            return false; // spot still occupied, ticket untouched - safe to retry
+
+        var freedSpot = _floorService.FreeSpot(ticket.floorNumber, ticket.parkingSpotId);
+        if (freedSpot == null)
+            return false; // shouldn't normally happen - spot was occupied a moment ago
+
+        // Re-enqueue the SAME spot instance returned by FreeSpot - not a newly
+        // constructed one. A new ParkingSpot() would get a new Guid id that doesn't
+        // exist in the repository, creating a phantom entry in the strategy's queue.
+        _parkingStrategy.AddParkingSpot(freedSpot);
         _ticketService.UpdateTicket(ticketId, unparkedAt, amount, "INR");
 
         return true;
